@@ -141,6 +141,7 @@ class ToyLinearModel(torch.nn.Module):
         return x
 
 
+
 def _get_ref_change_linear_weights_to_woqtensors(deprecated_tenosr_subclass):
     def _ref_change_linear_weights_to_woqtensors(model, filter_fn=None, **kwargs):
         """
@@ -636,6 +637,42 @@ class TestQuantFlow(TestCase):
                     self.assertTrue(
                         found_deprecated, f"did not find deprecated warning for {cls}"
                     )
+
+    def test_int8_weight_only_conv1d(self):
+        """Test int8 weight-only quantization for Conv1d and ConvTranspose1d."""
+        from torchao.quantization.quant_api import _is_conv1d
+
+        class ToyConv1dModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv1 = torch.nn.Conv1d(16, 32, 3, bias=False)
+                self.conv_t = torch.nn.ConvTranspose1d(32, 16, 3)
+                self.linear1 = torch.nn.Linear(16, 64)
+
+            def forward(self, x):
+                x = self.conv1(x)
+                x = self.conv_t(x)
+                return self.linear1(x.mean(-1))
+
+        m = ToyConv1dModel().eval()
+        x = torch.randn(2, 16, 128)
+        ref = m(x)
+
+        quantize_(m, Int8WeightOnlyConfig(), filter_fn=_is_conv1d)
+
+        # Conv layers should be quantized, Linear should not
+        self.assertIsInstance(m.conv1.weight, AffineQuantizedTensor)
+        self.assertIsInstance(m.conv_t.weight, AffineQuantizedTensor)
+        self.assertNotIsInstance(m.linear1.weight, AffineQuantizedTensor)
+
+        # Verify int8 dtype and shapes
+        self.assertEqual(m.conv1.weight.tensor_impl.dtype, torch.int8)
+        self.assertEqual(m.conv1.weight.shape, (32, 16, 3))
+        self.assertEqual(m.conv_t.weight.shape, (32, 16, 3))
+
+        # Numerical accuracy
+        res = m(x)
+        torch.testing.assert_close(ref, res, atol=1e-2, rtol=1e-2)
 
 
 common_utils.instantiate_parametrized_tests(TestQuantFlow)

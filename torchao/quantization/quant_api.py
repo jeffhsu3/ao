@@ -247,6 +247,28 @@ def _is_linear(mod, *args):
     )
 
 
+def _is_conv1d(mod, *args):
+    """Filter function to select Conv1d and ConvTranspose1d layers for quantization.
+
+    Args:
+        mod: Module to check
+
+    Returns:
+        True if module is a Conv1d or ConvTranspose1d layer that hasn't been quantized yet
+    """
+    from torchao.quantization.qat.affine_fake_quantized_tensor import (
+        _AffineFakeQuantizedTensor,
+    )
+
+    return (
+        isinstance(mod, (torch.nn.Conv1d, torch.nn.ConvTranspose1d))
+        and hasattr(mod, "weight")
+        and not isinstance(mod.weight, AffineQuantizedTensor)
+        and not isinstance(mod.weight, LinearActivationQuantizedTensor)
+        and not isinstance(mod.weight, _AffineFakeQuantizedTensor)
+    )
+
+
 def _get_subclass_inserter(cls, enable_parametrization=False, **kwargs):
     """
     Returns a function which inserts the given subclass into all linear modules
@@ -920,7 +942,68 @@ class Int8WeightOnlyConfig(AOBaseConfig):
             )
 
 
-def _int8_weight_only_quantize_tensor(weight, config):
+def _int8_weight_only_quantize_tensor(weight, config, module=None):
+    """Quantize weight tensor to int8.
+
+    Args:
+        weight: Weight tensor to quantize
+        config: Int8WeightOnlyConfig instance
+        module: Optional module instance for 3D tensor disambiguation (Conv1d vs MoE)
+
+    Returns:
+        Quantized weight tensor
+    """
+    # Maybe put this after MoE layers.
+    if weight.dim() == 3 and module is not None:
+        if isinstance(module, torch.nn.Conv1d):
+            if config.version == 2:
+                # Align version 2 granularity with version 1 (PerAxis(0))
+                granularity = config.granularity
+                if isinstance(granularity, PerRow) and granularity.dim == -1:
+                    from torchao.quantization.granularity import PerAxis
+                    granularity = PerAxis(axis=0)
+                new_weight = Int8Tensor.from_hp(weight, granularity=granularity)
+            else:
+                # Version 1: use to_affine_quantized_intx with per-row granularity
+                # Per-channel quantization along dimension 0
+                block_size = (1, weight.shape[1], weight.shape[2])
+                new_weight = to_affine_quantized_intx(
+                    weight,
+                    MappingType.SYMMETRIC,
+                    block_size,
+                    torch.int8,
+                    eps=torch.finfo(torch.float32).eps,
+                    zero_point_dtype=torch.int64,
+                )
+            return new_weight
+
+        elif isinstance(module, torch.nn.ConvTranspose1d):
+            # ConvTranspose1d: (in_channels, out_channels, kernel_size)
+            # Quantize per-output-channel (dimension 1)
+            if config.version == 2:
+                # Align version 2 granularity with version 1 (PerAxis(1))
+                granularity = config.granularity
+                if isinstance(granularity, PerRow) and granularity.dim == -1:
+                    from torchao.quantization.granularity import PerAxis
+                    granularity = PerAxis(axis=1)
+                new_weight = Int8Tensor.from_hp(weight, granularity=granularity)
+            else:
+                # Version 1: per-channel quantization along dimension 1
+                # This is more complex due to dimension ordering
+                # For now, use standard approach and let Int8Tensor handle it
+                block_size = (weight.shape[0], 1, weight.shape[2])
+                new_weight = to_affine_quantized_intx(
+                    weight,
+                    MappingType.SYMMETRIC,
+                    block_size,
+                    torch.int8,
+                    eps=torch.finfo(torch.float32).eps,
+                    zero_point_dtype=torch.int64,
+                )
+            return new_weight
+        else:
+            return weight
+
     if config.version == 1:
         warnings.warn(
             "Config Deprecation: version 1 of Int8WeightOnlyConfig is deprecated and will no longer be supported in a future release, please use version 2, see https://github.com/pytorch/ao/issues/2752 for more details"
@@ -962,7 +1045,7 @@ def _int8_weight_only_transform(
         + " but {module} does not have one"
     )
     quantized_tensor = _int8_weight_only_quantize_tensor(
-        getattr(module, parameter_name), config
+        getattr(module, parameter_name), config, module=module
     )
     setattr(
         module,

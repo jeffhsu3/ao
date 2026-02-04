@@ -260,6 +260,43 @@ def _(func, types, args, kwargs):
     return y.to(output_dtype)
 
 
+@implements(aten.convolution.default)
+@implements_torch_function([torch.nn.functional.conv1d, torch.nn.functional.conv_transpose1d])
+def _(func, types, args, kwargs):
+    """INT8 convolution: weight-only quantization with dequant fallback.
+
+    """
+    input_tensor = args[0]
+    weight_tensor = args[1]
+    bias = kwargs.get('bias', args[2] if len(args) > 2 else None)
+
+    assert isinstance(weight_tensor, Int8Tensor), (
+        f"Expected weight to be Int8Tensor, got {type(weight_tensor)}"
+    )
+
+    weight_dequant = weight_tensor.dequantize()
+
+    if func == torch.nn.functional.conv1d:
+        stride = kwargs.get('stride', args[3] if len(args) > 3 else 1)
+        padding = kwargs.get('padding', args[4] if len(args) > 4 else 0)
+        dilation = kwargs.get('dilation', args[5] if len(args) > 5 else 1)
+        groups = kwargs.get('groups', args[6] if len(args) > 6 else 1)
+        return torch.nn.functional.conv1d(
+            input_tensor, weight_dequant, bias, stride, padding, dilation, groups
+        )
+    elif func == torch.nn.functional.conv_transpose1d:
+        stride = kwargs.get('stride', args[3] if len(args) > 3 else 1)
+        padding = kwargs.get('padding', args[4] if len(args) > 4 else 0)
+        output_padding = kwargs.get('output_padding', args[5] if len(args) > 5 else 0)
+        groups = kwargs.get('groups', args[6] if len(args) > 6 else 1)
+        dilation = kwargs.get('dilation', args[7] if len(args) > 7 else 1)
+        return torch.nn.functional.conv_transpose1d(
+            input_tensor, weight_dequant, bias, stride, padding, output_padding, groups, dilation
+        )
+    else:
+        return func(input_tensor, weight_dequant, *args[2:], **kwargs)
+
+
 @implements(aten.slice.Tensor)
 def _(func, types, args, kwargs):
     """Slice operation for Int8Tensor"""
