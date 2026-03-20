@@ -1,10 +1,23 @@
 [build-system]
+
+
 requires = [
     "setuptools",
     "wheel",
+    "torch",
     # TODO(future): consider declaring build-time dependencies such
     # as `torch` here to enable PEP 517. For now, require the user to
     # install `torch` in their environment before running the build,
     # and only support builds with the `--no-build-isolation` flag.
 ]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchao"
+version = "0.16.0"
+description = "Package for applying ao techniques to GPU models"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/pytorch/ao"
