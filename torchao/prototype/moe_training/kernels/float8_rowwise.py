@@ -24,27 +24,21 @@ if torch_version_at_least("2.7.0") and has_triton():
         torch.int32: tl.int32,
         torch.int64: tl.int64,
         torch.float8_e4m3fn: tl.float8e4nv,
+        torch.float8_e4m3fnuz: tl.float8e4b8,
         torch.float8_e5m2: tl.float8e5,
+        torch.float8_e5m2fnuz: tl.float8e5b16,
         torch.float16: tl.float16,
         torch.bfloat16: tl.bfloat16,
         torch.float32: tl.float32,
         torch.float64: tl.float64,
     }
 
-    block_sizes_n = [128]  # large dim (output_features)
-    block_sizes_k = [128]  # small dim (input_features)
-    num_warps = [4]
-    num_stages = [4]
     atomic_kernel_configs_2D = [
         triton.Config(
-            {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k},
-            num_warps=warps,
-            num_stages=stages,
+            {"BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128},
+            num_warps=4,
+            num_stages=4,
         )
-        for block_size_n in block_sizes_n
-        for block_size_k in block_sizes_k
-        for warps in num_warps
-        for stages in num_stages
     ]
 
     @torch.library.custom_op(
@@ -205,7 +199,16 @@ if torch_version_at_least("2.7.0") and has_triton():
             + k_offs[None, :] * stride_scales_dim1
         )
         scales_mask = k_offs[None, :] < K
-        tl.atomic_min(scales_ptr + scales_offs, scales[None, :], mask=scales_mask)
+        # AMD GPUs need relaxed semantics for better performance
+        if tl.constexpr(torch.version.hip is not None):
+            tl.atomic_min(
+                scales_ptr + scales_offs,
+                scales[None, :],
+                mask=scales_mask,
+                sem="relaxed",
+            )
+        else:
+            tl.atomic_min(scales_ptr + scales_offs, scales[None, :], mask=scales_mask)
 
     @triton.autotune(configs=atomic_kernel_configs_2D, key=["num_elements"])
     @triton.jit
@@ -272,22 +275,12 @@ if torch_version_at_least("2.7.0") and has_triton():
         output_mask = (n_offs[:, None] < N) & (k_offs[None, :] < K)
         tl.store(output_ptr + output_offs, output_data, mask=output_mask)
 
-    block_sizes_n = [
-        64,
-    ]  # large dim (output_features)
-    block_sizes_k = [128]  # small dim (input_features)
-    num_warps = [8]
-    num_stages = [6]
     reduction_kernel_configs_2D = [
         triton.Config(
-            {"BLOCK_SIZE_N": block_size_n, "BLOCK_SIZE_K": block_size_k},
-            num_warps=warps,
-            num_stages=stages,
+            {"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128},
+            num_warps=8,
+            num_stages=6,
         )
-        for block_size_n in block_sizes_n
-        for block_size_k in block_sizes_k
-        for warps in num_warps
-        for stages in num_stages
     ]
 
     @triton.autotune(configs=reduction_kernel_configs_2D, key=["K", "N"])
