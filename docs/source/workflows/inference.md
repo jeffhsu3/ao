@@ -14,21 +14,24 @@ output_bf16 = to_fp8(input_bf16) @ to_fp8(weight_fp8.t())
 output_bf16 = input_bf16 @ weight_int4.t()
 ```
 
-## Quantization Techniques
+## Inference Workflows
 
-See the [API Reference documentation](https://docs.pytorch.org/ao/main/api_reference/api_ref_quantization.html) for code examples and detailed documentation for each quantization config:
+Below are the stable and near-stable inference workflows in torchao:
 
-- **float8 weight configs**: `Float8DynamicActivationFloat8WeightConfig`, `Float8WeightOnlyConfig`
-- **int8 weight configs**: `Int8DynamicActivationInt8WeightConfig`, `Int8WeightOnlyConfig`
-- **int4 weight configs**: `Int4WeightOnlyConfig`, `Float8DynamicActivationInt4WeightConfig`, `Int8DynamicActivationInt4WeightConfig`
-- **intx weight configs**: `IntxWeightOnlyConfig`, `Int8DynamicActivationIntxWeightConfig`
-
-Notes:
-- The quantization error incurred by applying int4 quantization to your model can be fairly significant, so using external techniques like GPTQ may be necessary to obtain a usable model.
-- Float8 quantization requires hardware with CUDA compute capability 8.9 or greater (e.g., H100).
-- Third-party backend CI status:
-  - Ascend NPU(requires torch_npu ≥ 2.7.1)
-  [![Ascend NPU](https://github.com/Ascend/Ascend-CI/actions/workflows/torchao.yml/badge.svg)](https://github.com/Ascend/Ascend-CI/actions/workflows/torchao.yml)
+| weight dtype | act dtype | summary |
+|--------------|-----------|---------|
+| float8 | float8 | {class}`~torchao.quantization.Float8DynamicActivationFloat8WeightConfig`: Applies float8 dynamic symmetric quantization to both activations and weights. Requires CUDA ≥8.9, AMD MI350+, or Intel XPU. Supports `PerTensor` and `PerRow` granularity. |
+| float8 | bf16 | {class}`~torchao.quantization.Float8WeightOnlyConfig`: Applies float8 weight-only symmetric per-channel quantization. Matmul computed in original precision. |
+| int8 | int8 | {class}`~torchao.quantization.Int8DynamicActivationInt8WeightConfig`: Applies int8 dynamic symmetric per-token activation and int8 per-channel weight quantization. |
+| int8 | bf16 | {class}`~torchao.quantization.Int8WeightOnlyConfig`: Applies int8 weight-only symmetric per-channel quantization. |
+| mxfp8 | mxfp8 | {class}`~torchao.prototype.mx_formats.MXDynamicActivationMXWeightConfig`(prototype): Applies mxfp8 or mxfp4 dynamic quantization to activations and weights. Requires NVIDIA SM100+ (Blackwell) or AMD MI350+. |
+| int4 | bf16 | {class}`~torchao.quantization.Int4WeightOnlyConfig`: Applies int4 weight-only groupwise quantization. Supports group sizes 256, 128, 64, 32. |
+| int4 | float8 | {class}`~torchao.quantization.Float8DynamicActivationInt4WeightConfig`: Applies float8 dynamic per-row activation and int4 per-group weight quantization. Group size 128 only. |
+| nvfp4 | bf16 | {class}`~torchao.prototype.mx_formats.NVFP4WeightOnlyConfig`(prototype): Applies NVFP4 weight-only quantization. |
+| nvfp4 | nvfp4 | {class}`~torchao.prototype.mx_formats.NVFP4DynamicActivationNVFP4WeightConfig`(prototype): Applies NVFP4 dynamic quantization to activations and weights with double quantization (per-tensor + per-block scales). Requires NVIDIA SM100+ (Blackwell). |
+| mxfp4 | mxfp4 | {class}`~torchao.prototype.mx_formats.MXDynamicActivationMXWeightConfig`(prototype): Applies mxfp8 or mxfp4 dynamic quantization to activations and weights. Requires NVIDIA SM100+ (Blackwell) or AMD MI350+. |
+| intx | bf16 | {class}`~torchao.quantization.IntxWeightOnlyConfig`: Applies intx (1-8 bit) weight-only quantization. Supports groupwise and per-channel. Works with Linear and Conv2D. |
+| intx | int8 | {class}`~torchao.quantization.Int8DynamicActivationIntxWeightConfig`: Applies int8 dynamic per-token activation and intx (1-8 bit) weight quantization. CPU optimized. |
 
 
 ## Accuracy benchmarks
@@ -55,10 +58,12 @@ SKIP_VLLM=1 ./benchmarks/quantization/measure_accuracy_and_performance.sh b200
 
 ## Performance benchmarks
 
+### e2e model level benchmarks
+
 All the following benchmarks are for `meta-llama/Llama-3.1-8B` using `torch==2.9.0` and `vllm==0.13.0`.
 
 
-### NVIDIA B200
+#### NVIDIA B200
 
 | weight | activation | prefill toks/s | decode toks/s | prefill_speedup | decode_speedup |
 | ------ | ---------- | -------------- | ------------- | --------------- | -------------- |
@@ -67,7 +72,7 @@ All the following benchmarks are for `meta-llama/Llama-3.1-8B` using `torch==2.9
 | nvfp4 | nvfp4 | 102786 | 15218.9 | 1.739 | 1.058 |
 | float8_rowwise | float8_rowwise | 69313.7 | 15984 | 1.173 | 1.112 |
 
-### NVIDIA H100
+#### NVIDIA H100
 
 | weight | activation | prefill toks/s | decode toks/s | prefill_speedup | decode_speedup |
 | ------ | ---------- | -------------- | ------------- | --------------- | -------------- |
@@ -89,6 +94,54 @@ SKIP_LM_EVAL=1 ./benchmarks/quantization/measure_accuracy_and_performance.sh h10
 vllm bench throughput --num_prompts 32 --input_len 4096 --output_len 32 --max_model_len 4128
 // 2. decode
 vllm bench throughput --num_prompts 128 --input_len 32 --output_len 2048 --max_model_len 2080
+```
+
+### Microbenchmarks
+
+The following set of microbenchmarks measures the roofline peak and observed execution time of
+a `ReLU -> Linear` toy model swept across various (M, K, N) shapes, with the activation
+shaped (M, K) and the weight shaped (K, N). This can be used to estimate expected speedup
+of quantizing `torch.nn.Linear` layers with various recipes based on the activation and weight shapes.
+
+#### NVIDIA B200
+
+```bash
+# `r_fp8_gemm_and_ovhd_spdp` is the roofline expected speedup of the
+#    quantized ReLU -> Linear layer vs high precision version
+# `b_fp8_e2e_spdp` is the observed speedup of the quantized
+#    ReLU -> Linear layer vs high precision version
+
+#
+# mxfp8
+#
+> python benchmarks/float8/float8_inference_roofline.py --recipe_name mxfp8_cublas --enable_fusion_modeling True --skip_printing_detailed_metrics True
+...
+GPU                     NVIDIA B200
+torch version           2.12.0.dev20260218+cu130
+torchao version         0.17.0+git3075bb624
+...
+   fwd_M  fwd_K  fwd_N  r_fp8_gemm_and_ovhd_spdp  b_fp8_e2e_spdp
+0   1024   1024   1024                      0.64            0.94
+1   2048   2048   2048                      1.75            1.21
+2   4096   4096   4096                      1.90            1.45
+3   8192   8192   8192                      1.94            1.75
+4  16384  16384  16384                      1.97            1.77
+
+#
+# nvfp4 with dynamic global scaling
+#
+> python benchmarks/float8/float8_inference_roofline.py --recipe_name nvfp4 --enable_fusion_modeling True --skip_printing_detailed_metrics True
+...
+GPU                     NVIDIA B200
+torch version           2.12.0.dev20260218+cu130
+torchao version         0.17.0+git3075bb624
+...
+   fwd_M  fwd_K  fwd_N  r_fp8_gemm_and_ovhd_spdp  b_fp8_e2e_spdp
+0   1024   1024   1024                      0.64            0.37
+1   2048   2048   2048                      2.39            0.74
+2   4096   4096   4096                      2.92            1.19
+3   8192   8192   8192                      3.34            1.78
+4  16384  16384  16384                      3.63            2.57
 ```
 
 ## Other Available Quantization Techniques
