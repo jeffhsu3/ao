@@ -9,9 +9,9 @@ from typing import Optional, Tuple
 import torch
 
 from torchao.dtypes.affine_quantized_tensor import register_layout
-from torchao.dtypes.utils import Layout
-from torchao.dtypes.uintx.plain_layout import PlainAQTTensorImpl
 from torchao.dtypes.uintx.bitpacking import pack, unpack
+from torchao.dtypes.uintx.plain_layout import PlainAQTTensorImpl
+from torchao.dtypes.utils import Layout
 
 
 @dataclass(frozen=True)
