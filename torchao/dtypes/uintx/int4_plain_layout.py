@@ -19,6 +19,7 @@ class Int4PlainLayout(Layout):
     """Layout class for int4 plain layout for affine quantized tensor.
     Stores mathematically flat int4 data efficiently packed into a uint8 tensor.
     """
+
     pack_dim: int = -1
     pad_amount: int = 0
 
@@ -50,18 +51,18 @@ class Int4PlainAQTTensorImpl(PlainAQTTensorImpl):
     ):
         assert isinstance(_layout, Int4PlainLayout)
         int_data_uint8 = int_data.to(torch.uint8)
-        
+
         # Pad if needed. bitpacking.pack requires the packed dimension to be a multiple of 8
         dim = _layout.pack_dim
         if dim < 0:
             dim += int_data.dim()
-            
+
         pad_amount = (8 - (int_data.shape[dim] % 8)) % 8
         if pad_amount > 0:
             pad_tuple = [0, 0] * int_data.dim()
             pad_tuple[2 * (int_data.dim() - 1 - dim) + 1] = pad_amount
             int_data_uint8 = torch.nn.functional.pad(int_data_uint8, pad_tuple)
-            
+
         # Recreate layout with padding amount
         _layout = Int4PlainLayout(pack_dim=_layout.pack_dim, pad_amount=pad_amount)
 
@@ -73,7 +74,7 @@ class Int4PlainAQTTensorImpl(PlainAQTTensorImpl):
     def get_plain(self) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # Dynamically unpack for compute backends or fallbacks
         unpacked_int_data = unpack([self.int_data], 4, dim=self._layout.pack_dim)
-        
+
         # Unpad if needed
         if self._layout.pad_amount > 0:
             dim = self._layout.pack_dim
@@ -83,7 +84,7 @@ class Int4PlainAQTTensorImpl(PlainAQTTensorImpl):
             slc = [slice(None)] * unpacked_int_data.dim()
             slc[dim] = slice(0, unpacked_int_data.shape[dim] - self._layout.pad_amount)
             unpacked_int_data = unpacked_int_data[tuple(slc)]
-            
+
         return unpacked_int_data, self.scale, self.zero_point
 
     @classmethod

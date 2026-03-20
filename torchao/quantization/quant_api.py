@@ -1008,6 +1008,7 @@ def _int8_weight_only_quantize_tensor(weight, config, module=None):
                 granularity = config.granularity
                 if isinstance(granularity, PerRow) and granularity.dim == -1:
                     from torchao.quantization.granularity import PerAxis
+
                     granularity = PerAxis(axis=0)
                 new_weight = Int8Tensor.from_hp(weight, granularity=granularity)
             else:
@@ -1032,6 +1033,7 @@ def _int8_weight_only_quantize_tensor(weight, config, module=None):
                 granularity = config.granularity
                 if isinstance(granularity, PerRow) and granularity.dim == -1:
                     from torchao.quantization.granularity import PerAxis
+
                     granularity = PerAxis(axis=1)
                 new_weight = Int8Tensor.from_hp(weight, granularity=granularity)
             else:

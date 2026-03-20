@@ -146,7 +146,6 @@ class ToyLinearModel(torch.nn.Module):
         return x
 
 
-
 def _get_ref_change_linear_weights_to_woqtensors(deprecated_tenosr_subclass):
     def _ref_change_linear_weights_to_woqtensors(model, filter_fn=None, **kwargs):
         """
