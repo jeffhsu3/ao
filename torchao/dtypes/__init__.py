@@ -14,6 +14,7 @@ from .floatx import (
 from .nf4tensor import NF4Tensor, to_nf4
 from .uintx import (
     Int4CPULayout,
+    Int4PlainLayout,
     Int4XPULayout,
     PackedLinearInt8DynamicActivationIntxWeightLayout,
     QDQLayout,
@@ -44,6 +45,7 @@ __all__ = [
     "BlockSparseLayout",
     "UintxLayout",
     "Int4CPULayout",
+    "Int4PlainLayout",
     "CutlassSemiSparseLayout",
     "QDQLayout",
     "PackedLinearInt8DynamicActivationIntxWeightLayout",

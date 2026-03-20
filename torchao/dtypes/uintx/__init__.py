@@ -1,6 +1,9 @@
 from .int4_cpu_layout import (
     Int4CPULayout,
 )
+from .int4_plain_layout import (
+    Int4PlainLayout,
+)
 from .int4_xpu_layout import (
     Int4XPULayout,
 )
@@ -25,6 +28,7 @@ __all__ = [
     "SemiSparseLayout",
     "TensorCoreTiledLayout",
     "Int4CPULayout",
+    "Int4PlainLayout",
     "PackedLinearInt8DynamicActivationIntxWeightLayout",
     "QDQLayout",
     "Int4XPULayout",
