@@ -435,6 +435,22 @@ def _(func, types, args, kwargs):
     return return_and_correct_aliasing(func, args, kwargs, new)
 
 
+@implements(aten.view.default)
+def _(func, types, args, kwargs):
+    # multi_linear does weight.view(num_linear, -1, chin) then indexes + F.linear.
+    # Dequantize here since the 3D shape is incompatible with the block structure
+    # and the result is immediately used for F.linear anyway.
+    self = args[0]
+    shape = args[1]
+    return self.dequantize().view(shape)
+
+
+@implements(aten.t.default)
+def _(func, types, args, kwargs):
+    self = args[0]
+    return self.dequantize().t()
+
+
 IntxUnpackedToInt8Tensor.__module__ = "torchao.quantization"
 
 # Allow a model with IntxUnpackedToInt8Tensor weights to be loaded with `weights_only=True`
