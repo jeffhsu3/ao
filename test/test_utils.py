@@ -9,7 +9,6 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from torchao.testing.utils import skip_if_no_cuda
 from torchao.utils import TorchAOBaseTensor, torch_version_at_least
 
 
@@ -56,6 +55,39 @@ class TestTorchAOBaseTensor(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "arg_types"):
             l.weight = torch.nn.Parameter(MyTensor(l.weight))
 
+    def test_get_to_kwargs_non_blocking(self):
+        """Verify _get_to_kwargs parses and returns the non_blocking flag."""
+
+        class MyTensor(TorchAOBaseTensor):
+            tensor_data_names = ["qdata"]
+            tensor_attribute_names = ["attr", "device"]
+
+            def __new__(cls, qdata, attr="attr", device=None):
+                if device is None:
+                    device = qdata.device
+                kwargs = {"device": device, "dtype": qdata.dtype}
+                r = torch.Tensor._make_wrapper_subclass(cls, qdata.shape, **kwargs)
+                r.qdata = qdata
+                r.attr = attr
+                return r
+
+            def __init__(self, qdata, attr="attr", device=None):
+                pass
+
+        t = MyTensor(torch.randn(4, 4))
+
+        # non_blocking=True is preserved
+        kwargs = t._get_to_kwargs(device="cpu", non_blocking=True)
+        self.assertTrue(kwargs["non_blocking"])
+
+        # non_blocking=False (explicit) is preserved
+        kwargs = t._get_to_kwargs(device="cpu", non_blocking=False)
+        self.assertFalse(kwargs["non_blocking"])
+
+        # default (not specified) → False
+        kwargs = t._get_to_kwargs(device="cpu")
+        self.assertFalse(kwargs["non_blocking"])
+
     def _test_default_impls_helper(self, lp_tensor, lp_tensor_for_copy):
         # get `all_tensor_data_names` and `all_tensor_attribute_names`
         all_tensor_data_names = lp_tensor.tensor_data_names.copy()
@@ -95,14 +127,15 @@ class TestTorchAOBaseTensor(unittest.TestCase):
         self.assertTrue(torch.equal(lp_tensor.qdata, reconstructed.qdata))
         self.assertEqual(lp_tensor.attr, reconstructed.attr)
 
+        device = torch.accelerator.current_accelerator()
         # test _get_to_kwargs
-        _ = lp_tensor._get_to_kwargs(torch.strided, device="cuda")
-        _ = lp_tensor._get_to_kwargs(layout=torch.strided, device="cuda")
+        _ = lp_tensor._get_to_kwargs(torch.strided, device=device)
+        _ = lp_tensor._get_to_kwargs(layout=torch.strided, device=device)
 
         # `to` / `_to_copy`
         original_device = lp_tensor.device
-        lp_tensor = lp_tensor.to("cuda")
-        self.assertEqual(lp_tensor.device.type, "cuda")
+        lp_tensor = lp_tensor.to(device)
+        self.assertEqual(lp_tensor.device.type, device.type)
         lp_tensor = lp_tensor.to(original_device)
         self.assertEqual(lp_tensor.device, original_device)
 
@@ -185,7 +218,7 @@ class TestTorchAOBaseTensor(unittest.TestCase):
                 getattr(lp_tensor, tensor_attribute_name),
             )
 
-    @skip_if_no_cuda()
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need CUDA available")
     def test_default_impls(self):
         """Making sure some common functions has default implementations, such as
         __tensor_unflatten__, __tensor_flatten__, _apply_fn_to_data, __repr__, to
@@ -215,7 +248,7 @@ class TestTorchAOBaseTensor(unittest.TestCase):
         lp_tensor_for_copy = MyTensor(another_tensor, "attr", None)
         self._test_default_impls_helper(lp_tensor, lp_tensor_for_copy)
 
-    @skip_if_no_cuda()
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_default_impls_with_optional_data(self):
         class MyTensorWithOptionalData(TorchAOBaseTensor):
             tensor_data_names = ["qdata"]
@@ -252,7 +285,7 @@ class TestTorchAOBaseTensor(unittest.TestCase):
         )
         self._test_default_impls_helper(lp_tensor, lp_tensor_for_copy)
 
-    @skip_if_no_cuda()
+    @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
     def test_default_impls_with_optional_attr(self):
         class MyTensorWithOptionalData(TorchAOBaseTensor):
             tensor_data_names = ["qdata"]

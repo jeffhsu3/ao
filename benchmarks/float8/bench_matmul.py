@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import ScalingType, SwizzleType
 from utils import (
     do_benchmarks,
     get_name_to_shapes_iter,
@@ -19,11 +20,7 @@ from utils import (
 from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.prototype.mx_formats.utils import to_blocked
 from torchao.testing.training.roofline_utils import get_specs
-from torchao.utils import is_MI300, torch_version_at_least
-
-# ScalingType and SwizzleType are only available in PyTorch 2.10+
-if torch_version_at_least("2.10.0"):
-    from torch.nn.functional import ScalingType, SwizzleType
+from torchao.utils import is_MI300
 
 
 @torch.inference_mode()
@@ -56,6 +53,7 @@ def run(
     print(
         f"peak tops: bf16 {bf16_peak_tops:.2e}, fp8 {fp8_peak_tops:.2e}, fp4 {fp4_peak_tops:.2e}"
     )
+    speedup_col = "fp4_speedup" if use_fp4 else "fp8_speedup"
     headers = (
         "fast_accum",
         "name",
@@ -66,7 +64,7 @@ def run(
         "pct_top_peak",
         "ref_time_s",
         "time_s",
-        "fp8_speedup",
+        speedup_col,
     )
     results = []
 
@@ -159,10 +157,6 @@ def run(
         def do_matmul_mxfp4(A, B):
             nonlocal scale_a
             nonlocal scale_b
-            if not torch_version_at_least("2.10.0"):
-                raise RuntimeError(
-                    "MXFP4 matmul requires PyTorch 2.10.0 or later for F.scaled_mm support"
-                )
             return F.scaled_mm(
                 A,
                 B,

@@ -41,5 +41,17 @@ class KernelPreference(str, Enum):
     2. Debugging kernel numerics issues.
     """
 
+    DEEPGEMM = "deepgemm"
+    """Use kernels from the optional DeepGEMM library."""
+
+    TRITON = "triton"
+    """Use quantize and quantized mm kernels written in Triton, requires triton
+    """
+
+    CUTEDSL = "cutedsl"
+    """Use quantize and quantized mm kernels written in CuTeDSL, requires the
+    nvidia-cutlass-dsl library
+    """
+
 
 torch.serialization.add_safe_globals([KernelPreference])

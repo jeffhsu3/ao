@@ -47,8 +47,6 @@ from torchao.quantization.quant_api import (
     ModuleFqnToConfig,
     PerRow,
     PerTensor,
-    Quantizer,
-    TwoStepQuantizer,
     _replace_with_custom_fn_if_matches_filter,
 )
 from torchao.quantization.quant_primitives import MappingType
@@ -64,7 +62,6 @@ from torchao.utils import (
     is_sm_at_least_89,
     is_sm_at_least_90,
     is_sm_at_least_100,
-    torch_version_at_least,
     unwrap_tensor_subclass,
 )
 
@@ -90,7 +87,7 @@ def capture_and_prepare(model, example_inputs):
     return m
 
 
-class XNNPackDynamicQuantizer(TwoStepQuantizer):
+class XNNPackDynamicQuantizer:
     def prepare(self, model: torch.nn.Module) -> torch.nn.Module:
         _replace_with_custom_fn_if_matches_filter(
             model,
@@ -110,7 +107,7 @@ class XNNPackDynamicQuantizer(TwoStepQuantizer):
         return model
 
 
-class TorchCompileDynamicQuantizer(Quantizer):
+class TorchCompileDynamicQuantizer:
     def quantize(self, model: torch.nn.Module) -> torch.nn.Module:
         quantize_(model, Int8DynamicActivationInt8WeightConfig())
         return model
@@ -135,7 +132,7 @@ class ToyLinearModel(torch.nn.Module):
         return x
 
 
-def _get_ref_change_linear_weights_to_woqtensors(deprecated_tenosr_subclass):
+def _get_ref_change_linear_weights_to_woqtensors(deprecated_tensor_subclass):
     def _ref_change_linear_weights_to_woqtensors(model, filter_fn=None, **kwargs):
         """
         The deprecated implementation for weight only quant API, used as a reference for
@@ -148,7 +145,7 @@ def _get_ref_change_linear_weights_to_woqtensors(deprecated_tenosr_subclass):
         _replace_with_custom_fn_if_matches_filter(
             model,
             _get_subclass_inserter(
-                deprecated_tenosr_subclass, enable_parametrization=True, **kwargs
+                deprecated_tensor_subclass, enable_parametrization=True, **kwargs
             ),
             filter_fn,
         )
@@ -160,6 +157,33 @@ class TestQuantFlow(TestCase):
     GPU_DEVICES = (["cuda"] if torch.cuda.is_available() else []) + (
         ["xpu"] if torch.xpu.is_available() else []
     )
+
+    def setUp(self):
+        super().setUp()
+        # quantize_() sets a global float32 matmul precision; snapshot fp32_precision
+        self._prev_cuda_matmul_fp32 = torch.backends.cuda.matmul.fp32_precision
+        self._prev_mkldnn_matmul_fp32 = torch.backends.mkldnn.matmul.fp32_precision
+
+    def tearDown(self):
+        torch.backends.cuda.matmul.fp32_precision = self._prev_cuda_matmul_fp32
+        torch.backends.mkldnn.matmul.fp32_precision = self._prev_mkldnn_matmul_fp32
+        super().tearDown()
+
+    def test_quantize_does_not_leak_fp32_precision(self):
+        # quantize_() must not mutate the process wide fp32 precision flags, torch's
+        # TestCase.tearDown reports any change as "fp32 precision flag leak detected"
+        backends = (
+            torch.backends.cuda.matmul,
+            torch.backends.cudnn.conv,
+            torch.backends.cudnn.rnn,
+            torch.backends.mkldnn.matmul,
+            torch.backends.mkldnn.conv,
+            torch.backends.mkldnn.rnn,
+        )
+        before = [b.fp32_precision for b in backends]
+        m = ToyLinearModel().eval()
+        quantize_(m, Int8WeightOnlyConfig())
+        self.assertEqual([b.fp32_precision for b in backends], before)
 
     def test_dynamic_quant_gpu_singleline(self):
         if is_ROCM():
@@ -255,6 +279,36 @@ class TestQuantFlow(TestCase):
         m = quantizer.quantize(m)
         assert isinstance(m.linear1, Int8DynActInt4WeightLinear)
         assert isinstance(m.linear2, Int8DynActInt4WeightLinear)
+        m(*example_inputs)
+
+    def test_8da4w_quantizer_scales_precision(self):
+        # Regression test: _convert_for_runtime must build the runtime modules
+        # with scales_precision (not precision) for their scales/zeros buffers.
+        # It previously passed self.precision, so a quantizer configured with a
+        # distinct scales_precision silently produced runtime modules whose
+        # scales were cast to the activation precision instead.
+        from torchao.quantization.linear_quant_modules import Int8DynActInt4WeightLinear
+        from torchao.quantization.quant_api import Int8DynActInt4WeightQuantizer
+
+        quantizer = Int8DynActInt4WeightQuantizer(
+            groupsize=32,
+            precision=torch.float32,
+            scales_precision=torch.bfloat16,
+        )
+        m = ToyLinearModel(bias=True).eval()
+        example_inputs = m.example_inputs()
+        m = quantizer.quantize(m)
+        for name in ("linear1", "linear2"):
+            mod = getattr(m, name)
+            assert isinstance(mod, Int8DynActInt4WeightLinear)
+            # scales/zeros buffers follow scales_precision...
+            self.assertEqual(mod.scales.dtype, torch.bfloat16)
+            self.assertEqual(mod.zeros.dtype, torch.bfloat16)
+            # ...while the activation precision and bias buffer still follow
+            # precision. Asserting these guards against a future change that
+            # over-corrects by routing everything through scales_precision.
+            self.assertEqual(mod.precision, torch.float32)
+            self.assertEqual(mod.bias.dtype, torch.float32)
         m(*example_inputs)
 
     @unittest.skipIf(not torch.accelerator.is_available(), "Need GPU available")
@@ -572,12 +626,12 @@ class TestQuantFlow(TestCase):
         quantize_(m, Int8WeightOnlyConfig(), filter_fn=_is_conv1d)
 
         # Conv layers should be quantized, Linear should not
-        self.assertIsInstance(m.conv1.weight, AffineQuantizedTensor)
-        self.assertIsInstance(m.conv_t.weight, AffineQuantizedTensor)
-        self.assertNotIsInstance(m.linear1.weight, AffineQuantizedTensor)
+        self.assertIsInstance(m.conv1.weight, Int8Tensor)
+        self.assertIsInstance(m.conv_t.weight, Int8Tensor)
+        self.assertNotIsInstance(m.linear1.weight, Int8Tensor)
 
         # Verify int8 dtype and shapes
-        self.assertEqual(m.conv1.weight.tensor_impl.dtype, torch.int8)
+        self.assertEqual(m.conv1.weight.qdata.dtype, torch.int8)
         self.assertEqual(m.conv1.weight.shape, (32, 16, 3))
         self.assertEqual(m.conv_t.weight.shape, (32, 16, 3))
 
@@ -1079,7 +1133,7 @@ class TestFqnToConfig(TestCase):
         ]
         if is_sm_at_least_100():
             configs.append(MXDynamicActivationMXWeightConfig())
-        if is_sm_at_least_100() and torch_version_at_least("2.8.0"):
+        if is_sm_at_least_100():
             configs.append(NVFP4DynamicActivationNVFP4WeightConfig())
         for config in configs:
             with self.subTest(config=type(config).__name__):

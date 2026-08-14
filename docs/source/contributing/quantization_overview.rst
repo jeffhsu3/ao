@@ -25,8 +25,8 @@ Basic DTypes
 
 No matter what quantization we are doing, in the end we will be using some low precision dtypes to represent the quantized data or quantization parameters, the low precision dtypes relevant for torchao are:
 
-* ``torch.uint1`` to ``torch.uint7`` available in pytorch 2.3 and later
-* ``torch.int1`` to ``torch.int7`` available in pytorch 2.6 and later
+* ``torch.uint1`` to ``torch.uint7``
+* ``torch.int1`` to ``torch.int7``
 * ``torch.float4_e2m1fn_x2``, ``torch.float8_e4m3fn``, ``torch.float8_e4m3fnuz``, ``torch.float8_e5m2``, ``torch.float8_e5m2fnuz``, ``torch.float8_e8m0fnu``
 
 In terms of actual implementation, ``uint1`` to ``uint7`` and ``int1`` to ``int7`` are just placeholders that does not have real implementations (i.e. the ops does not work for the PyTorch Tensor with these dtypes). Example PR added these dtypes can be found `here <https://github.com/pytorch/pytorch/pull/117208>`__. Floating point dtypes are what we call shell dtypes that have limited op support.
@@ -54,8 +54,7 @@ We'll also have efficient kernels that works with the low precision tensors, for
 
 * `torch.ops.mslk.f8f8bf16_rowwise <https://github.com/pytorch/ao/blob/6cfa47705f60ea614695b52b4b120ac5fd84d1cb/torchao/quantization/quantize_/workflows/float8/float8_tensor.py#L280>`__ (rowwise float8 activation and float8 weight matrix multiplication kernel in MSLK library)
 * `torch._scaled_mm <https://github.com/pytorch/ao/blob/6cfa47705f60ea614695b52b4b120ac5fd84d1cb/torchao/float8/inference.py#L116>`__ (float8 activation and float8 weight matrix multiplication kernel in PyTorch for both rowwise and tensorwise)
-* `int_matmul <https://github.com/pytorch/ao/blob/3e9746cf636e39e3c1ec0de6e0ef2e31f75c4c02/torchao/kernel/intmm.py#L90>`__ that takes two int8 tensors and outputs an int32 tensor
-* `int_scaled_matmul <https://github.com/pytorch/ao/blob/3e9746cf636e39e3c1ec0de6e0ef2e31f75c4c02/torchao/kernel/intmm.py#L107>`__ that does matmul and also applies a scale to the result.
+* `_int_scaled_matmul <https://github.com/pytorch/ao/blob/main/torchao/quantization/quantize_/workflows/int8/kernels.py>`__ that does matmul and also applies a scale to the result.
 
 .. note::
    We can also rely on torch.compile to generate kernels (through triton), for example the int8 weight only quantization kernel just relies on torch.compile to get speedup. In this case there is no custom handwritten "efficient kernel" that's corresponding to the type of quantization.
@@ -141,7 +140,7 @@ We'll skip the instruction for now since we haven't seen many use cases for stat
 Other Quantization Flows
 ########################
 
-For other quantization flow/algorithms that does not fit into any of the above, we also intend to provide examples for common patterns. For example, `Autoround <https://github.com/pytorch/ao/blob/main/torchao/prototype/autoround/README.md>`__ uses `MultiTensor <https://gist.github.com/HDCharles/a1b575bbf8875f994af8a01b225e1227>`__ and module hooks to optimize the module.
+For other quantization flow/algorithms that does not fit into any of the above, we also intend to provide examples for common patterns.
 
 If you are working on a new quantization algorithm/flow and not sure how to implement it in a PyTorch native way, please feel free to open an issue to describe how your algorithm works and we can help advise on the implementation details.
 

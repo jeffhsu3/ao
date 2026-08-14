@@ -90,7 +90,7 @@ To reproduce these benchmarks, run
 // on an h100
 SKIP_LM_EVAL=1 ./benchmarks/quantization/measure_accuracy_and_performance.sh h100
 // on a b200
-SKIP_LM_EVAL=1 ./benchmarks/quantization/measure_accuracy_and_performance.sh h100
+SKIP_LM_EVAL=1 ./benchmarks/quantization/measure_accuracy_and_performance.sh b200
 
 // under the hood, the actual vllm benchmark is doing the following:
 // 1. prefill
@@ -138,15 +138,15 @@ to increase as MKN increases.
 > python benchmarks/float8/float8_inference_roofline.py --recipe_name mxfp8_cublas --enable_fusion_modeling True --skip_printing_detailed_metrics True
 ...
 GPU                     NVIDIA B200
-torch version           2.12.0.dev20260218+cu130
-torchao version         0.17.0+git3075bb624
+torch version           2.12.0.dev20260414+cu130
+torchao version         0.17.0+gitbd7717d20
 ...
    fwd_M  fwd_K  fwd_N  r_fp8_gemm_and_ovhd_spdp  b_fp8_e2e_spdp
-0   1024   1024   1024                      1.00            0.93
-1   2048   2048   2048                      1.75            1.20
-2   4096   4096   4096                      1.90            1.46
+0   1024   1024   1024                      1.00            0.96
+1   2048   2048   2048                      1.76            1.22
+2   4096   4096   4096                      1.89            1.50
 3   8192   8192   8192                      1.94            1.76
-4  16384  16384  16384                      1.97            1.77
+4  16384  16384  16384                      1.97            1.81
 
 #
 # nvfp4 with dynamic global scaling
@@ -221,7 +221,7 @@ We have kernels that do 8-bit dynamic quantization of activations and uintx grou
 |               | int8_dynamic_activation_intx_weight-4-256-false  |  16.03        |  65.81                  |  NA              | 4.11            |
 |               | int8_dynamic_activation_intx_weight-3-256-false  |  18.94        |  59.97                  |  NA              | 3.17            |
 
-You can try out these apis with the `quantize_` api as above alongside the config `Int8DynamicActivationIntxWeightConfig`.  An example can be found in `torchao/_models/llama/generate.py`.
+You can try out these apis with the `quantize_` api as above alongside the config `Int8DynamicActivationIntxWeightConfig`.
 
 ### Codebook Quantization
 The benchmarks below were run on a single NVIDIA-A6000 GPU.
@@ -233,7 +233,7 @@ The benchmarks below were run on a single NVIDIA-A6000 GPU.
 | Llama-3.1-8B| Base (bfloat16)         |  7.713              |  32.16        |  482.70                 | 16.35            | 15.01           |
 |             | codebook-4-64           |  10.095             |  1.73         |  8.63                   | 23.11            |  4.98           |
 
-You try can out these apis with the `quantize_` api as above alongside the config `CodebookWeightOnlyConfig` an example can be found in  in `torchao/_models/llama/generate.py`.
+You try can out these apis with the `quantize_` api as above alongside the config `CodebookWeightOnlyConfig`.
 
 ### Low-Precision FP8 Attention (Prototype)
 

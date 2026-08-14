@@ -9,9 +9,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from torchao.kernel import (
-    int_scaled_matmul,
-)
 from torchao.quantization.quant_primitives import (
     MappingType,
     ZeroPointDomain,
@@ -25,10 +22,7 @@ from torchao.quantization.quant_primitives import (
     dequantize_affine,
     quantize_affine,
 )
-from torchao.utils import (
-    check_cpu_version,
-    check_xpu_version,
-)
+from torchao.utils import _is_device
 
 from .granularity import (
     Granularity,
@@ -43,7 +37,6 @@ from .granularity import (
 __all__ = [
     "compute_error",
     "_quantize_activation_per_token_absmax",
-    "_quant_int8_dynamic_per_token_linear",
     "dynamically_quantize_per_channel",
     "dequantize_per_tensor",
     "dequantize_per_channel",
@@ -195,86 +188,6 @@ def _quantize_activation_per_token_absmax(t):
     return quantized, scale
 
 
-def _quant_int8_dynamic_per_token_linear(
-    x,
-    w_vals_int8_t,
-    w_scales,
-    bias,
-    out_dtype,
-):
-    """
-    like F.linear, but with int8 dynamic quantization of activation,
-    and a quantized weight
-    """
-    x_vals_int8, x_scales = _quantize_activation_per_token_absmax(x)
-    mm_out = _quant_int8_per_token_matmul(
-        x_vals_int8, x_scales, w_vals_int8_t, w_scales, out_dtype
-    )
-    if bias is not None:
-        mm_out = mm_out + bias
-    return mm_out
-
-
-def _quant_int8_per_token_matmul(
-    x_vals_int8,
-    x_scales,
-    w_vals_int8_t,
-    w_scales,
-    output_dtype=torch.float32,
-):
-    """
-    Quantized matmul of int8 operands that accumulates to int32 and returns
-    output_dtype. For now, this is written for approximate numerical
-    Assumes that activation and weight quantization are symmetric,
-    i.e. act_zp and w_zp is 0.
-    Assumes that weight quantization is per-channel.
-
-    see
-    https://github.com/google/gemmlowp/blob/master/doc/quantization.md
-    for an overview of quantized matmul compute
-
-    in scalar form, assuming output_dtype is fp32 and zw == 0:
-
-      Y_i_j_fp32 = sx * sw dot(X_i, W_j)
-    """
-
-    assert x_vals_int8.dtype == torch.int8, (
-        f"x dtype {x_vals_int8.dtype} not yet supported"
-    )
-    assert w_vals_int8_t.dtype == torch.int8, (
-        f"w dtype {w_vals_int8_t.dtype} not yet supported"
-    )
-
-    assert x_scales.dtype in [
-        torch.float,
-        torch.bfloat16,
-    ], (
-        f"x_scales needs to be a torch.float32 or torch.bfloat16 but got {x_scales.dtype}"
-    )
-
-    #
-    # 1. do the matrix form of dot(X_i, W_j)
-    #
-    #
-    # 2. rescale the output
-    #
-    # in cases with large matrices, y_dot_int32 can grow sufficiently
-    # large that y_dot_int32 * a float16 scale is greater than the maximum
-    # value of a float 16, (which results in a value of inf even if multiplying
-    # by the other scale would bring it within the expected range)
-
-    tmp = x_vals_int8.reshape(-1, x_vals_int8.shape[-1])
-    y_dot_scaled = int_scaled_matmul(tmp, w_vals_int8_t, x_scales.reshape(-1, 1))
-
-    y = (y_dot_scaled * w_scales).reshape(
-        *x_vals_int8.shape[:-1], y_dot_scaled.shape[-1]
-    )
-
-    # can downcast only at the very end
-    y = y.to(output_dtype)
-    return y
-
-
 def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
     """
     assumes symmetric quantization
@@ -285,7 +198,7 @@ def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
 
     assert x.dim() == 2, "only support 2d Tensors"
 
-    eps = torch.finfo(torch.float32).eps
+    eps = torch.finfo(torch.float32).smallest_normal
     block_size = (1, x.shape[1])
     zero_point_dtype = torch.int64
 
@@ -462,11 +375,11 @@ def groupwise_affine_quantize_tensor_from_qparams(
         quant_max,
     )
     if w.shape[-1] > 1:
-        if (not (check_cpu_version(int_data.device))) and (
-            not (check_xpu_version(int_data.device))
+        if (not (_is_device("cpu", int_data.device))) and (
+            not (_is_device("xpu", int_data.device))
         ):
             int_data = (int_data[::, ::2] << 4 | int_data[::, 1::2]).to(torch.uint8)
-        if check_xpu_version(int_data.device):
+        if _is_device("xpu", int_data.device):
             int_data = (int_data[::, 1::2] << 4 | int_data[::, ::2]).to(torch.uint8)
     return int_data
 
@@ -483,7 +396,7 @@ def groupwise_affine_dequantize_tensor_from_qparams(
     assert w_int4x8.dim() == 2
     # need to handle single column case so check for dtype/size from groupwise_affine_quantize_tensor_from_qparams path
     if (w_int4x8.dtype == torch.uint8 or w_int4x8.shape[-1] > 1) and not (
-        check_cpu_version(w_int4x8.device)
+        _is_device("cpu", w_int4x8.device)
     ):
         data = w_int4x8.to(torch.int32)
         high_bits = data >> 4
@@ -493,7 +406,7 @@ def groupwise_affine_dequantize_tensor_from_qparams(
             dtype=torch.int32,
             device=w_int4x8.device,
         )
-        if not (check_xpu_version(w_int4x8.device)):
+        if not (_is_device("xpu", w_int4x8.device)):
             w_int32[::, ::2] = high_bits
             w_int32[::, 1::2] = low_bits
         else:
@@ -582,7 +495,7 @@ def get_group_qparams_symmetric(
 
     block_size = (1, groupsize)
     if eps is None:
-        eps = torch.finfo(w.dtype).eps
+        eps = torch.finfo(w.dtype).smallest_normal
     ranges = {}
     ranges[1] = (-1, 0)
     # generating ranges for bit 2 to 8
@@ -683,14 +596,16 @@ def recommended_inductor_config_setter():
         force_fuse_int_mm_with_mul = True
         fx_graph_cache = True
         triton.unique_kernel_names = True
-        torch.set_float32_matmul_precision("high")
+
+    This used to also call `torch.set_float32_matmul_precision("high")`. That is not an
+    inductor config, it is process wide state that changes the numerics of every fp32
+    matmul in the process and is never restored, so it is left to the caller.
     """
     torch._inductor.config.coordinate_descent_tuning = True
     torch._inductor.config.coordinate_descent_check_all_directions = True
     torch._inductor.config.force_fuse_int_mm_with_mul = True
     torch._inductor.config.fx_graph_cache = True
     torch._inductor.config.triton.unique_kernel_names = True
-    torch.set_float32_matmul_precision("high")
 
 
 def get_block_size(

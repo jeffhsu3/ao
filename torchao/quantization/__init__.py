@@ -1,8 +1,3 @@
-from torchao.kernel import (
-    int_scaled_matmul,
-    safe_int_mm,
-)
-
 from .granularity import (
     Granularity,
     PerAxis,
@@ -58,9 +53,10 @@ from .quantize_.workflows import (
     Int8Tensor,
     IntxOpaqueTensor,
     IntxUnpackedToInt8Tensor,
+    NF4Tensor,
+    to_nf4,
 )
 from .transform_module import register_quantize_module_handler
-from .unified import Quantizer, TwoStepQuantizer
 from .utils import (
     compute_error,
 )
@@ -96,6 +92,8 @@ __all__ = [
     "IntxUnpackedToInt8Tensor",
     "Int4TilePackedTo4dTensor",
     "Float8Tensor",
+    "NF4Tensor",
+    "to_nf4",
     "compute_error",
     # building blocks
     "AffineQuantizedMinMaxObserver",
@@ -105,9 +103,6 @@ __all__ = [
     "choose_qparams_affine_with_min_max",
     "quantize_affine",
     "dequantize_affine",
-    # operators/kernels
-    "safe_int_mm",
-    "int_scaled_matmul",
     # registration of module transforms for quantize_
     "register_quantize_module_handler",
     # dataclasses and types
@@ -124,7 +119,5 @@ __all__ = [
     "Int4WeightOnlyQuantizer",
     "Int8DynActInt4WeightQuantizer",
     "Int8DynActInt4WeightLinear",
-    "TwoStepQuantizer",
-    "Quantizer",
     "Float8MMConfig",
 ]

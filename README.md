@@ -63,19 +63,18 @@ Check out our [docs](https://docs.pytorch.org/ao/main/) for more details!
 First, install TorchAO. We recommend installing the latest stable version:
 ```bash
 pip install torchao
+# optional - install MSLK for float8 and nvfp4 inference kernels
+pip install mslk --index-url https://download.pytorch.org/whl/cu130
+# optional - install apache-tvm-ffi and cutedsl for mxfp8 MoE training kernels
+pip install apache-tvm-ffi
+pip install nvidia-cutlass-dsl==4.5.2 nvidia-cutlass-dsl-libs-base==4.5.2 nvidia-cutlass-dsl-libs-cu13==4.5.2
 ```
 
 Quantize your model weights to int4!
 ```python
 import torch
 from torchao.quantization import Int4WeightOnlyConfig, quantize_
-if torch.cuda.is_available():
-  # quantize on CUDA
-  quantize_(model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="tile_packed_to_4d", int4_choose_qparams_algorithm="hqq"))
-elif torch.xpu.is_available():
-  # quantize on XPU
-  quantize_(model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="plain_int32"))
-
+quantize_(model, Int4WeightOnlyConfig(group_size=32, int4_packing_format="tile_packed_to_4d", int4_choose_qparams_algorithm="hqq"))
 ```
 See our [quick start guide](https://docs.pytorch.org/ao/stable/quick_start.html) for more details.
 
@@ -112,13 +111,20 @@ Please see the [torchao compability table](https://github.com/pytorch/ao/issues/
 
 ### Optional Dependencies
 
-[MSLK](https://github.com/pytorch/MSLK) is an optional runtime dependency that provides accelerated kernels for some of the workflows in torchao. Stable MSLK should be used with stable torchao, and nightly MSLK with nightly torchao.
+[MSLK](https://github.com/meta-pytorch/mslk) is an optional runtime dependency that provides accelerated kernels for some of the workflows in torchao. Stable MSLK should be used with stable torchao, and nightly MSLK with nightly torchao.
 ```bash
 # Stable
-pip install mslk-cuda==1.0.0
+pip install mslk --index-url https://download.pytorch.org/whl/cu130
 
 # Nightly
-pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu128
+pip install --pre mslk --index-url https://download.pytorch.org/whl/nightly/cu130
+```
+
+`apache-tvm-ffi` and `nvidia-cutlass-dsl` are used for MoE mxfp8 training kernels.
+
+```bash
+pip install apache-tvm-ffi
+pip install nvidia-cutlass-dsl==4.5.2 nvidia-cutlass-dsl-libs-base==4.5.2 nvidia-cutlass-dsl-libs-cu13==4.5.2
 ```
 
 ## 🔎 Inference
@@ -128,7 +134,6 @@ TorchAO delivers substantial performance gains with minimal code changes:
 - **Int4 weight-only**: [1.73x speedup with 65% less memory](https://huggingface.co/pytorch/gemma-3-12b-it-INT4) for Gemma3-12b-it on H100 with slight impact on accuracy
 - **Float8 dynamic quantization**: [1.5-1.6x speedup on gemma-3-27b-it](https://huggingface.co/pytorch/gemma-3-27b-it-FP8/blob/main/README.md#results-h100-machine) and [1.54x and 1.27x speedup on Flux.1-Dev* and CogVideoX-5b respectively](https://github.com/sayakpaul/diffusers-torchao) on H100 with preserved quality
 - **Int8 activation quantization and int4 weight quantization**: Quantized Qwen3-4B running with 14.8 tokens/s with 3379 MB memory usage on iPhone 15 Pro through [ExecuTorch](https://huggingface.co/pytorch/Qwen3-4B-INT8-INT4#running-in-a-mobile-app)
-- **Int4 + 2:4 Sparsity**: [2.37x throughput with 67.7% memory reduction](torchao/sparsity/README.md) on Llama-3-8B
 
 Following is our recommended flow for quantization and deployment:
 ```python
@@ -233,16 +238,7 @@ Our float8 training is integrated into [TorchTitan's pre-training flows](https:/
 * [Float8 in PyTorch](https://dev-discuss.pytorch.org/t/float8-in-pytorch-1-x/1815)
 
 <details>
-  <summary>Other features (sparse training, memory efficient optimizers)</summary>
-
-### Sparse Training
-
-We've added support for semi-structured 2:4 sparsity with **6% end-to-end speedups on ViT-L**. Full blog [here](https://pytorch.org/blog/accelerating-neural-network-training/). The code change is a 1 liner with the full example available [here](torchao/sparsity/training/):
-
-```python
-from torchao.sparsity.training import SemiSparseLinear, swap_linear_with_semi_sparse_linear
-swap_linear_with_semi_sparse_linear(model, {"seq.0": SemiSparseLinear})
-```
+  <summary>Other features (memory efficient optimizers)</summary>
 
 ### Memory-efficient optimizers
 
@@ -275,7 +271,7 @@ optim.load_state_dict(ckpt["optim"])
 
 [FSDP2](https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md): Historically most quantization has been done for inference, there is now a thriving area of research combining distributed algorithms and quantization.
 
-The best example we have combining the composability of lower bit dtype with compile and fsdp is [NF4](torchao/dtypes/nf4tensor.py) which we used to implement the [QLoRA](https://www.youtube.com/watch?v=UvRl4ansfCg) algorithm. So if you're doing research at the intersection of this area we'd love to hear from you.
+The best example we have combining the composability of lower bit dtype with compile and fsdp is [NF4](torchao/quantization/quantize_/workflows/nf4/nf4_tensor.py) which we used to implement the [QLoRA](https://www.youtube.com/watch?v=UvRl4ansfCg) algorithm. So if you're doing research at the intersection of this area we'd love to hear from you.
 
 Our framework makes it straightforward to add tensor parallel support to your custom quantized tensor subclass. Check out our [tensor parallel tutorial](tutorials/developer_api_guide/tensor_parallel.py) to see how a quantized tensor subclass can be extended to support column and row-wise tensor sharding while maintaining compatibility with `torch.compile`.
 

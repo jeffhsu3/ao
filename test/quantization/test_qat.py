@@ -37,6 +37,7 @@ from torchao.quantization.linear_quant_modules import (
     _replace_linear_8da4w,
     _replace_linear_int4,
 )
+from torchao.quantization.qat import TwoStepQuantizer
 from torchao.quantization.qat.api import (
     ComposableQATQuantizer,
     FromIntXQuantizationAwareTrainingConfig,
@@ -55,6 +56,7 @@ from torchao.quantization.qat.fake_quantize_config import (
 )
 from torchao.quantization.qat.fake_quantizer import (
     Float8FakeQuantizer,
+    Int4WeightFakeQuantizer,
     IntxFakeQuantizer,
 )
 from torchao.quantization.qat.linear import (
@@ -85,9 +87,6 @@ from torchao.quantization.quant_primitives import (
     quantize_affine,
 )
 from torchao.quantization.quantize_.workflows import Int4PackingFormat
-from torchao.quantization.unified import (
-    TwoStepQuantizer,
-)
 from torchao.quantization.utils import (
     _get_per_token_block_size,
     compute_error,
@@ -103,7 +102,6 @@ from torchao.utils import (
     is_MI300,
     is_MI350,
     is_sm_at_least_89,
-    torch_version_at_least,
 )
 
 # TODO: put this in a common test utils file
@@ -111,7 +109,6 @@ _CUDA_IS_AVAILABLE = torch.cuda.is_available()
 _DEVICE = (
     get_current_accelerator_device() if torch.accelerator.is_available() else "cpu"
 )
-_MXFP4_TORCH_AVAILABLE = torch_version_at_least("2.8.0")
 
 
 class Sub(torch.nn.Module):
@@ -1785,6 +1782,41 @@ class TestQAT(TestCase):
         sqnr = compute_error(out, out_expected)
         self.assertGreater(sqnr, 16)
 
+    def test_fake_quantizer_enabled_attribute(self):
+        """
+        Test that `Int4WeightFakeQuantizer` and `Float8FakeQuantizer` initialize
+        `enabled = True` and gate fake quantization in forward, matching the
+        behavior of `IntxFakeQuantizer`.
+        """
+        # Int4WeightFakeQuantizer: enabled gate exercised on CPU via the
+        # bf16 activation path, which only uses ATen ops.
+        int4_config = Int4WeightFakeQuantizeConfig(
+            group_size=32,
+            activation_dtype=torch.bfloat16,
+        )
+        int4_fake_quantizer = Int4WeightFakeQuantizer(int4_config)
+        self.assertTrue(int4_fake_quantizer.enabled)
+
+        torch.manual_seed(self.SEED)
+        w = torch.randn(64, 64, dtype=torch.bfloat16)
+
+        int4_fake_quantizer.enabled = False
+        torch.testing.assert_close(int4_fake_quantizer(w), w, atol=0, rtol=0)
+
+        int4_fake_quantizer.enabled = True
+        self.assertFalse(torch.equal(int4_fake_quantizer(w), w))
+
+        # Float8FakeQuantizer: only the disabled path is exercised here,
+        # since the enabled path requires fp8-capable hardware (covered by
+        # `test_float8_fake_quantize`).
+        float8_config = Float8FakeQuantizeConfig(torch.float8_e4m3fn, PerRow())
+        float8_fake_quantizer = Float8FakeQuantizer(float8_config)
+        self.assertTrue(float8_fake_quantizer.enabled)
+
+        x = torch.randn(32, 64)
+        float8_fake_quantizer.enabled = False
+        torch.testing.assert_close(float8_fake_quantizer(x), x, atol=0, rtol=0)
+
     def _test_quantize_api_against_ptq(
         self,
         base_config: AOBaseConfig,
@@ -1955,7 +1987,8 @@ class TestQAT(TestCase):
         self.assertEqual(weight_config.group_size, 128)
         self.assertEqual(weight_config.activation_dtype, e4m3_dtype)
 
-    def test_infer_int4_weight_only_config(self):
+    @parametrize("group_size", [256, 128, 64, 32])
+    def test_infer_int4_weight_only_config(self, group_size: int):
         """
         Test that fake quantize configs are correctly inferred from `Int4WeightOnlyConfig`.
         """
@@ -1963,11 +1996,11 @@ class TestQAT(TestCase):
             _infer_fake_quantize_configs,
         )
 
-        base_config = Int4WeightOnlyConfig(version=2)
+        base_config = Int4WeightOnlyConfig(version=2, group_size=group_size)
         (act_config, weight_config) = _infer_fake_quantize_configs(base_config)
         self.assertIsNone(act_config)
         self.assertIsInstance(weight_config, Int4WeightFakeQuantizeConfig)
-        self.assertEqual(weight_config.group_size, 128)
+        self.assertEqual(weight_config.group_size, group_size)
         self.assertEqual(weight_config.activation_dtype, torch.bfloat16)
 
     @unittest.skipIf(not is_sm_at_least_89(), "Need sm89+")
@@ -2327,7 +2360,6 @@ class TestQAT(TestCase):
         torch.testing.assert_close(m.linear2.weight.scale, scale2)
         torch.testing.assert_close(m.sub.linear.weight.scale, sub_scale)
 
-    @unittest.skipIf(not _MXFP4_TORCH_AVAILABLE, "Need pytorch 2.8+ for MXFP4")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_mx_fake_quantize_config(self):
         """Test MXFakeQuantizeConfig dataclass with various element dtypes."""
@@ -2362,15 +2394,12 @@ class TestQAT(TestCase):
         )
         self.assertEqual(config_fp8_e5m2.dtype, torch.float8_e5m2)
 
-    @unittest.skipIf(not _MXFP4_TORCH_AVAILABLE, "Need pytorch 2.8+ for MXFP4")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     @parametrize("bias", [True, False])
     @parametrize("input_shape", [(128, 256), (1, 128, 256), (2, 4, 128, 256)])
     @parametrize(
         "dtype",
-        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn, torch.float8_e5m2]
-        if _MXFP4_TORCH_AVAILABLE
-        else [None],
+        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn, torch.float8_e5m2],
     )
     def test_mx_fake_quantized_linear_forward(self, bias, input_shape, dtype):
         """Test MXFakeQuantizedLinear forward pass with various dtypes and input ranks."""
@@ -2409,7 +2438,6 @@ class TestQAT(TestCase):
         else:
             self.assertGreaterEqual(sqnr, 10.0)
 
-    @unittest.skipIf(not torch_version_at_least("2.8.0"), "Need pytorch 2.8+")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     @parametrize("bias", [True, False])
     def test_mx_fake_quantized_linear_backward(self, bias):
@@ -2459,7 +2487,6 @@ class TestQAT(TestCase):
         self.assertGreaterEqual(x_grad_sqnr, 3.0)
         self.assertGreaterEqual(w_grad_sqnr, 3.0)
 
-    @unittest.skipIf(not torch_version_at_least("2.8.0"), "Need pytorch 2.8+")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_mx_fake_quantized_linear_to_linear(self):
         """Test converting MXFakeQuantizedLinear back to nn.Linear."""
@@ -2491,7 +2518,6 @@ class TestQAT(TestCase):
         torch.testing.assert_close(converted_linear.weight, mx_linear.weight)
         torch.testing.assert_close(converted_linear.bias, mx_linear.bias)
 
-    @unittest.skipIf(not torch_version_at_least("2.8.0"), "Need pytorch 2.8+")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_mx_config_error_handling(self):
         """Test error handling for MX config."""
@@ -2515,7 +2541,6 @@ class TestQAT(TestCase):
                 weight_config=MXFakeQuantizeConfig(),
             )
 
-    @unittest.skipIf(not torch_version_at_least("2.8.0"), "Need pytorch 2.8+")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     @parametrize(
         "shapes",
@@ -2550,7 +2575,6 @@ class TestQAT(TestCase):
 
         self.assertGreaterEqual(sqnr, SQNR_THRESHOLD)
 
-    @unittest.skipIf(not torch_version_at_least("2.8.0"), "Need pytorch 2.8+")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     def test_mx_training_simulation(self):
         """Simulate a simple training loop with MX QAT."""
@@ -2594,15 +2618,11 @@ class TestQAT(TestCase):
         # Check that weights have been updated
         self.assertFalse(torch.allclose(mx_model[0].weight, initial_weight))
 
-    @unittest.skipIf(not torch_version_at_least("2.10.0"), "Need pytorch 2.10+")
-    @unittest.skipIf(not _MXFP4_TORCH_AVAILABLE, "Need pytorch 2.10+ for MXFP4")
     @unittest.skipIf(not _CUDA_IS_AVAILABLE, "skipping when cuda is not available")
     @unittest.skipIf(not is_sm_at_least_89(), "Need sm89+")
     @parametrize(
         "dtype",
-        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn]
-        if _MXFP4_TORCH_AVAILABLE
-        else [None],
+        [torch.float4_e2m1fn_x2, torch.float8_e4m3fn],
     )
     def test_quantize_api_mx(self, dtype):
         """

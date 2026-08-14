@@ -25,7 +25,6 @@ from torchao.utils import (
     is_mslk_version_at_least,
     is_ROCM,
     is_sm_at_least_100,
-    torch_version_at_least,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,10 +110,6 @@ def f6_e3m2_unpacked_to_f32(x: torch.Tensor):
     return _floatx_unpacked_to_f32(x, EBITS_F6_E3M2, MBITS_F6_E3M2)
 
 
-# pack/unpack code copy-pasted from
-# https://github.com/pytorch-labs/ao/blob/main/torchao/dtypes/uint4.py
-
-
 def down_size(size):
     assert size[-1] % 2 == 0, f"{size} last dim not divisible by two"
     return (*size[:-1], size[-1] // 2)
@@ -165,7 +160,7 @@ def pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
     return (uint8_data[::2] | uint8_data[1::2] << 4).view(down_size(shape))
 
 
-if torch_version_at_least("2.7.0") and has_triton():
+if has_triton():
     import triton
     import triton.language as tl
     from torch.library import triton_op, wrap_triton
@@ -442,10 +437,10 @@ else:
         x_hp: torch.Tensor,
         block_size,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise AssertionError("needs torch version 2.8+ and triton")
+        raise AssertionError("needs triton")
 
     def triton_mx_block_rearrange(scale_tensor: torch.Tensor) -> torch.Tensor:
-        raise AssertionError("needs torch version 2.8+ and triton")
+        raise AssertionError("needs triton")
 
     def triton_mxfp8_dequant_dim0(
         e4m3_data: torch.Tensor,
@@ -453,12 +448,11 @@ else:
         out_dtype: torch.dtype,
         inner_block_size=32,
     ) -> torch.Tensor:
-        raise AssertionError("needs torch version 2.8+ and triton")
+        raise AssertionError("needs triton")
 
 
 _triton_kernels_available = (
-    torch_version_at_least("2.7.0")
-    and has_triton()
+    has_triton()
     and torch.cuda.is_available()
     and (is_sm_at_least_100() and is_cuda_version_at_least(12, 8))
     or (is_ROCM() and is_MI350())
@@ -480,18 +474,18 @@ if _triton_kernels_available:
 
         # Handle special cases and normal values using nested tl.where
         descale_fp = tl.where(
-            scale_e8m0_biased == 255,  # NaN case -> return NaN
+            scale_e8m0_biased == 255,  # E8M0 NaN -> NaN
             float("nan"),
             tl.where(
-                scale_e8m0_biased == 254,  # Inf case -> return 2^-127
+                # The reciprocal of byte 254 (2^127) is the FP32 subnormal
+                # 2^-127, which the exponent-only shift below cannot produce.
+                scale_e8m0_biased == 254,
                 2**-127,
-                tl.where(
-                    scale_e8m0_biased == 0,  # Zero case -> return 1.0 (no scaling)
-                    1.0,
-                    # Normal case: fast bit manipulation (254 - biased_exp) << 23
-                    ((254 - scale_e8m0_biased).to(tl.int32) << FP32_MANTISSA_BITS).to(
-                        tl.float32, bitcast=True
-                    ),
+                # Normal case: fast bit manipulation (254 - biased_exp) << 23.
+                # Byte 0 (2^-127) needs no special case: it yields 254 << 23,
+                # i.e. 2^127.
+                ((254 - scale_e8m0_biased).to(tl.int32) << FP32_MANTISSA_BITS).to(
+                    tl.float32, bitcast=True
                 ),
             ),
         )
@@ -499,25 +493,38 @@ if _triton_kernels_available:
         return descale_fp
 
     @triton.jit
+    def _triton_f32_to_e8m0_rceil(value):
+        value_bits = value.to(tl.int32, bitcast=True)
+        biased_exponent = (value_bits >> 23) & 0xFF
+        mantissa = value_bits & 0x7FFFFF
+
+        # Normal FP32 values round up when any mantissa bit is set. For FP32
+        # subnormals, E8M0 byte 0 is 2^-127, so only values above that round to 1.
+        needs_round_up = tl.where(
+            biased_exponent == 0,
+            mantissa > 0x400000,
+            mantissa != 0,
+        )
+        e8m0_biased = biased_exponent + needs_round_up.to(tl.int32)
+        return tl.where(biased_exponent != 0xFF, e8m0_biased, 0xFF).to(tl.uint8)
+
+    @triton.jit
+    def _triton_amax_nan_as_inf(x, axis):
+        # A custom tl.reduce using tl.maximum(...,
+        # propagate_nan=tl.PropagateNan.ALL) would express this directly, but
+        # currently risks a Triton FP8-store miscompile:
+        # https://github.com/triton-lang/triton/issues/11111
+        # See also torchao/float8/_inductor_patch.py.
+        x = tl.where(x == x, x, float("inf"))
+        return tl.max(x, axis=axis)
+
+    @triton.jit
     def _triton_calculate_scale_rceil(x, axis, USE_PTX: tl.constexpr):
         """
         Calculates and returns reciprocal scale using RCEIL rounding mode
         """
-        # There is no good support for accessing globals from a jit'ed triton
-        # function, so we redefine them here. Since this is prototype code which
-        # we plan to remove after torch.compile catches up, this is fine.
-        e8m0_exponent_bias = 127
-
         # Find the maximum absolute value for each row
-        max_abs = tl.max(x, axis=axis)
-
-        # Check for NaN presence: if ANY element in each row is NaN,
-        # set that row's max_abs to NaN (per-axis NaN detection)
-        nan_mask = x != x
-        has_nan_per_axis = tl.max(nan_mask, axis=axis)
-
-        # If any element in a row was NaN, set that row's max_abs to NaN
-        max_abs = tl.where(has_nan_per_axis > 0, float("nan"), max_abs)
+        max_abs = _triton_amax_nan_as_inf(x, axis)
 
         F8E4M3_MAX_RCP: tl.constexpr = 1.0 / 448.0
 
@@ -527,7 +534,7 @@ if _triton_kernels_available:
         if USE_PTX:
             # Use PTX instruction for normal values
             scale_e8m0_biased = tl.inline_asm_elementwise(
-                asm="cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;",
+                asm="cvt.rp.ue8m0x2.f32 $0, 0.0, $1;",
                 constraints="=h,r",
                 args=[scale_input.to(tl.float32, bitcast=False)],
                 dtype=tl.uint16,
@@ -535,13 +542,7 @@ if _triton_kernels_available:
                 pack=1,
             ).to(tl.uint8)
         else:
-            # Fallback implementation
-            scale_e8m0_unbiased = tl.clamp(
-                tl.ceil(tl.log2(scale_input)),
-                min=-1 * e8m0_exponent_bias,
-                max=e8m0_exponent_bias,
-            )
-            scale_e8m0_biased = (scale_e8m0_unbiased + 127).to(tl.uint8)
+            scale_e8m0_biased = _triton_f32_to_e8m0_rceil(scale_input)
 
         descale_fp = _calculate_reciprocal_scale(scale_e8m0_biased)
 
@@ -557,17 +558,17 @@ if _triton_kernels_available:
         # we plan to remove after torch.compile catches up, this is fine.
         target_max_pow2 = 8
         e8m0_exponent_bias = 127
-        bf16_mbits = 7
-        bf16_exp_bias = 127
+        fp32_mbits = 23
+        fp32_exp_bias = 127
 
         # Find the maximum absolute value for each row
-        max_abs = tl.max(x, axis=axis)
+        max_abs = _triton_amax_nan_as_inf(x, axis)
 
         # Original floor implementation
         # Calculate the e8m0 scale by extracting the exponent (floor)
-        max_abs = max_abs.to(tl.bfloat16)
-        max_abs_int16 = max_abs.to(tl.int16, bitcast=True)
-        extracted_pow2 = ((max_abs_int16 >> bf16_mbits) & 0b11111111) - bf16_exp_bias
+        max_abs = max_abs.to(tl.float32)
+        max_abs_int32 = max_abs.to(tl.int32, bitcast=True)
+        extracted_pow2 = ((max_abs_int32 >> fp32_mbits) & 0b11111111) - fp32_exp_bias
         extracted_pow2 = extracted_pow2 - target_max_pow2
         scale_e8m0_unbiased = extracted_pow2.to(tl.bfloat16)
 
@@ -579,6 +580,7 @@ if _triton_kernels_available:
 
         # Create the biased e8m0 representation and cast it to 8 bits
         scale_e8m0_biased = scale_e8m0_unbiased + e8m0_exponent_bias
+        scale_e8m0_biased = tl.where(max_abs < float("inf"), scale_e8m0_biased, 255)
         scale_e8m0_biased = scale_e8m0_biased.to(tl.uint8)
 
         # Calculate reciprocal scale using helper function for consistency with RCEIL
@@ -1001,14 +1003,14 @@ else:
         inner_block_size=32,
         scaling_mode: str = "rceil",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise AssertionError("needs torch version 2.8+ and triton")
+        raise AssertionError("needs triton")
 
     def triton_to_mxfp8_dim1(
         x,
         inner_block_size=32,
         scaling_mode: str = "rceil",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise AssertionError("needs torch version 2.8+ and triton")
+        raise AssertionError("needs triton")
 
 
 _mxfp8_cuda_kernels_available = (
@@ -1048,14 +1050,18 @@ if _mxfp8_cuda_kernels_available:
         # Input shape must be 2D.
         assert x.ndim == 2
         rows, cols = x.shape
+        assert rowwise or colwise, "at least one output orientation is required"
 
         # Block size must be a multiple of 32.
         block_size = 32
         assert rows % block_size == 0, "rows must be a multiple of 32"
         assert cols % block_size == 0, "cols must be a multiple of 32"
 
-        scale_dim_x = 1
-        scale_dim_y = block_size
+        # These dimensions independently select 1x32 rowwise groups and 32x1
+        # colwise groups. Setting both to 32 fuses the two orientations in one
+        # kernel; it does not change either scale granularity to 32x32.
+        scale_dim_x = block_size if rowwise else 1
+        scale_dim_y = block_size if colwise else 1
         fp8_format = "e4m3"
         output_rowwise, output_colwise, scales_rowwise, scales_colwise = (
             torch.ops.torchao.mxfp8_quantize.default(
@@ -1083,14 +1089,14 @@ if _mxfp8_cuda_kernels_available:
         """Fake/meta implementation for mxfp8_quantize."""
         assert x.ndim == 2
         rows, cols = x.shape
-        num_row_blocks = rows // 32
-        num_col_blocks = cols // 32
+        num_row_blocks = rows // scale_dim_y if colwise else 0
+        num_col_blocks = cols // scale_dim_x if rowwise else 0
 
         # rowwise
         if rowwise:
             output_rowwise = x.new_empty(rows, cols, dtype=torch.float8_e4m3fn)
             scales_rowwise = x.new_empty(
-                rows, num_col_blocks, 1, dtype=torch.float8_e8m0fnu
+                rows, num_col_blocks, dtype=torch.float8_e8m0fnu
             )
         else:
             output_rowwise = x.new_empty(0, dtype=torch.float8_e4m3fn)
@@ -1126,10 +1132,12 @@ if _mxfp8_cuda_kernels_available:
         fp8_format: str,
         scaling_mode: str,
     ):
-        # Op returns 4 tensors: (output_rowwise, output_colwise, scales_rowwise, scales_colwise)
-        # When rowwise=False, outputs 0 and 2 are empty tensors (size 0).
-        # output_colwise has shape (rows, cols) in col-major order.
-        # scales_colwise has shape (cols, num_row_blocks) in col-major order.
+        # Op returns 4 tensors:
+        # (output_rowwise, output_colwise, scales_rowwise, scales_colwise).
+        # The rowwise tensors have shapes (rows, cols) and
+        # (rows, num_col_blocks); the colwise tensors have shapes (rows, cols)
+        # and (cols, num_row_blocks). Disabled orientations return empty
+        # tensors, which must remain replicated because they cannot be sharded.
         #
         # Format: (output_placements, input_placements)
         # Input placements: one per arg (x=Tensor, then 6 non-tensor args=None)
@@ -1143,20 +1151,30 @@ if _mxfp8_cuda_kernels_available:
             [Replicate()] + non_tensor_args,
         )
 
-        # When input is sharded along dim 0:
-        # output_colwise (rows, cols) col-major: rows are sharded → Shard(0)
-        # scales_colwise (cols, num_row_blocks) col-major: row blocks sharded → Shard(1)
-        # Unused rowwise outputs (empty tensors): Replicate()
+        # When input is sharded along dim 0 (rows), both quantized outputs and
+        # rowwise scales are sharded along their row dimension. Colwise scales
+        # track input rows through num_row_blocks, their second dimension.
         rule_shard_dim0 = (
-            [Replicate(), Shard(0), Replicate(), Shard(1)],
+            [
+                Shard(0) if rowwise else Replicate(),
+                Shard(0) if colwise else Replicate(),
+                Shard(0) if rowwise else Replicate(),
+                Shard(1) if colwise else Replicate(),
+            ],
             [Shard(0)] + non_tensor_args,
         )
 
-        # When input is sharded along dim 1:
-        # output_colwise: cols are sharded → Shard(1)
-        # scales_colwise: col dim is sharded → Shard(0)
+        # When input is sharded along dim 1 (cols), both quantized outputs are
+        # sharded along their column dimension. Rowwise scales track input
+        # columns through num_col_blocks (dim 1), while columns are dim 0 of
+        # the colwise scales.
         rule_shard_dim1 = (
-            [Replicate(), Shard(1), Replicate(), Shard(0)],
+            [
+                Shard(1) if rowwise else Replicate(),
+                Shard(1) if colwise else Replicate(),
+                Shard(1) if rowwise else Replicate(),
+                Shard(0) if colwise else Replicate(),
+            ],
             [Shard(1)] + non_tensor_args,
         )
 
@@ -1213,7 +1231,7 @@ def _mslk_quantize_nvfp4_custom_op(
     """
     assert _mslk_available, (
         "mslk is required for NVFP4 triton quantization. "
-        "Install from https://github.com/pytorch/MSLK"
+        "Install from https://github.com/meta-pytorch/MSLK"
     )
     from mslk.quantize.triton.fp4_quantize import (
         triton_quantize_nvfp4 as _mslk_triton_quantize_nvfp4,
@@ -1249,3 +1267,87 @@ def _(x, global_scale=None):
     scales = scales.view(*orig_leading_dims, -1, padded_cols)
     xq = xq.view(*orig_leading_dims, -1, N // 2)
     return scales, xq
+
+
+def mslk_calculate_group_max(x: torch.Tensor, m_sizes: torch.Tensor) -> torch.Tensor:
+    """Compute per-expert activation global scale (encoding convention).
+
+    Args:
+        x: [M, K] concatenated activation tensor (bf16/fp16).
+        m_sizes: [E] int64 tensor of rows per expert.
+
+    Returns:
+        Per-expert global scale in encoding convention (448 * FP4_MAX / amax),
+        shape [E], dtype float32.
+    """
+    return _mslk_calculate_group_max_custom_op(x, m_sizes)
+
+
+@torch.library.custom_op("ao::mslk_calculate_group_max", mutates_args=())
+def _mslk_calculate_group_max_custom_op(
+    x: torch.Tensor, m_sizes: torch.Tensor
+) -> torch.Tensor:
+    assert _mslk_available, (
+        "mslk is required for calculate_group_max. "
+        "Install from https://github.com/meta-pytorch/MSLK"
+    )
+    from mslk.quantize.triton.fp4_quantize import calculate_group_max
+
+    global_scale, _ = calculate_group_max(x, m_sizes)
+    return global_scale
+
+
+@_mslk_calculate_group_max_custom_op.register_fake
+def _(x, m_sizes):
+    E = m_sizes.shape[0]
+    return x.new_empty(E, dtype=torch.float32)
+
+
+def mslk_quantize_nvfp4_stacked(
+    m_sizes: torch.Tensor,
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize concatenated MoE activations to NVFP4 with per-expert global scales.
+
+    Args:
+        m_sizes: [E] int64 tensor of rows per expert.
+        x: [M, K] concatenated activation tensor (bf16/fp16).
+        global_scale: [E] fp32 per-expert global scales in encoding convention.
+
+    Returns:
+        Tuple of (xq, scale):
+            xq: [M, K//2] float4_e2m1fn_x2 packed FP4 data.
+            scale: Padded+swizzled float8_e4m3fn block scales.
+    """
+    return _mslk_quantize_nvfp4_stacked_custom_op(m_sizes, x, global_scale)
+
+
+@torch.library.custom_op("ao::mslk_quantize_nvfp4_stacked", mutates_args=())
+def _mslk_quantize_nvfp4_stacked_custom_op(
+    m_sizes: torch.Tensor,
+    x: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert _mslk_available, (
+        "mslk is required for nvfp4_quantize_stacked. "
+        "Install from https://github.com/meta-pytorch/MSLK"
+    )
+    from mslk.quantize.triton.fp4_quantize import nvfp4_quantize_stacked
+
+    xq, scale = nvfp4_quantize_stacked(m_sizes, x, global_scale)
+    return xq, scale
+
+
+@_mslk_quantize_nvfp4_stacked_custom_op.register_fake
+def _(m_sizes, x, global_scale):
+    M, K = x.shape[0], x.shape[1]
+    num_segments = m_sizes.shape[0]
+    # Upper-bound on padded total rows (each segment can add at most 127 padding rows)
+    padded_total_M_ub = M + num_segments * 127
+    num_scales_per_row = K // 16
+    n_col_blocks = triton.cdiv(num_scales_per_row, 4)
+    padded_cols = n_col_blocks * 4
+    xq = x.new_empty(M, K // 2, dtype=torch.float4_e2m1fn_x2)
+    scale = x.new_empty(padded_total_M_ub, padded_cols, dtype=torch.float8_e4m3fn)
+    return xq, scale

@@ -8,12 +8,12 @@ import re
 from contextlib import contextmanager
 from functools import partial
 from importlib import import_module
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Optional
 
 import torch
 from torch import nn
 
-from .distributed_utils import _is_main_process
+from .distributed_utils import _is_dtensor, _is_main_process
 
 RE_PREFIX = ":"
 
@@ -33,10 +33,13 @@ def get_index_linspace(
 
 
 @contextmanager
-def use_deterministic_algorithms():
-    """Context manager to enable deterministic algorithms in PyTorch"""
+def use_deterministic_algorithms(mode: bool = True):
+    """Context manager that toggles PyTorch's deterministic-algorithms mode."""
     deterministic_restore = torch.are_deterministic_algorithms_enabled()
-    torch.use_deterministic_algorithms(True)
+    if deterministic_restore == mode:
+        yield
+        return
+    torch.use_deterministic_algorithms(mode)
     try:
         yield
     finally:
@@ -59,10 +62,10 @@ def instantiate_module(module_name: str):
 
 def get_param_groups(
     model: nn.Module,
-    prune_config: Dict[Tuple[nn.Module, str], Any],
-    skip_wd_names: Optional[Set[str]] = None,
+    prune_config: dict[tuple[nn.Module, str], Any],
+    skip_wd_names: Optional[set[str]] = None,
     verbose: bool = True,
-) -> Dict[str, Dict[str, Any]]:
+) -> dict[str, dict[str, Any]]:
     # Create list of regex patterns for matching parameter names
     re_pats = [
         re.compile(k[len(RE_PREFIX) :])
@@ -127,17 +130,43 @@ def latent_svd(self, name=""):
     S = getattr(self, f"{name}_S")
     Vh = getattr(self, f"{name}_Vh")
     orig_shape = torch.Size(getattr(self, f"{name}_orig_shape"))
-    return torch.linalg.multi_dot([U, torch.diag(S), Vh]).view(orig_shape)
+    return ((U * S) @ Vh).view(orig_shape)
+
+
+def _isolate_module_class(module: nn.Module) -> type:
+    """Return a per-instance subclass so descriptor patches don't leak.
+
+    Patching the SVD descriptor onto ``module.__class__`` would mutate the
+    shared class (e.g. ``nn.Linear``) for every module in the process; a
+    private subclass isolates it to this instance.
+    """
+    cls = module.__class__
+    if cls.__dict__.get("_pat_svd_isolated", False):
+        return cls
+    private_cls = type(cls.__name__, (cls,), {"_pat_svd_isolated": True})
+    module.__class__ = private_cls
+    return private_cls
 
 
 def insert_svd_modules_(model: nn.Module, optimizer: torch.optim.Optimizer):
-    """Replaces the parameters of the model with their SVD decompositions."""
-    param_set = {
-        p.data_ptr()
+    """Replaces dense parameters with their SVD decompositions.
+
+    DTensor conversion is intentionally unsupported because this function
+    replaces model parameters with dense U/S/Vh tensors and has no placement or
+    mesh policy for the resulting modules.
+    """
+    svd_params = [
+        p
         for group in optimizer.regularized_param_groups()
         for p in group["params"]
         if group["group_type"] == "SVDGrouper"
-    }
+    ]
+    if any(_is_dtensor(p) for p in svd_params):
+        raise TypeError(
+            "insert_svd_modules_ does not support DTensor parameters; convert "
+            "the model to dense parameters before inserting SVD modules."
+        )
+    param_set = {p.data_ptr() for p in svd_params}
 
     def insert_inner_(model):
         for mn, module in model.named_children():
@@ -148,7 +177,9 @@ def insert_svd_modules_(model: nn.Module, optimizer: torch.optim.Optimizer):
 
                 k = int(optimizer.state[p]["sv_count"].item())
                 assert k > 0, f"Invalid sv_count={k}"
-                with instantiate_module("pat.group.SVDGrouper")(p) as grouper:
+                with instantiate_module("torchao.prototype.pat.group.SVDGrouper")(
+                    p
+                ) as grouper:
                     # patch parameter with SVD
                     module.register_buffer(
                         f"{pn}_orig_shape", torch.tensor(grouper.orig_shape)
@@ -168,7 +199,7 @@ def insert_svd_modules_(model: nn.Module, optimizer: torch.optim.Optimizer):
 
                 module.__dict__.pop(pn, None)  # delete the original parameter
                 setattr(
-                    module.__class__,
+                    _isolate_module_class(module),
                     pn,
                     FuncDescriptor(partial(latent_svd, name=pn)),
                 )

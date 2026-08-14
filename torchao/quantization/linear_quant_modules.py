@@ -21,7 +21,6 @@ from .quant_primitives import (
     MappingType,
     dequantize_affine,
 )
-from .unified import Quantizer
 from .utils import (
     group_quantize_tensor_symmetric,
     groupwise_affine_quantize_tensor,
@@ -232,7 +231,7 @@ def replace_linear_int4(
     )
 
 
-class Int4WeightOnlyQuantizer(Quantizer):
+class Int4WeightOnlyQuantizer:
     def __init__(
         self,
         groupsize: int = 256,
@@ -532,7 +531,7 @@ def replace_linear_8da4w(
     )
 
 
-class Int8DynActInt4WeightQuantizer(Quantizer):
+class Int8DynActInt4WeightQuantizer:
     def __init__(
         self,
         groupsize: int = 256,
@@ -607,8 +606,7 @@ class Int8DynActInt4WeightQuantizer(Quantizer):
             self.groupsize,
             self.padding_allowed,
             self.precision,
-            # TODO: this should be self.scales_precision?
-            self.precision,
+            self.scales_precision,
         )
         return model
 
